@@ -1,0 +1,53 @@
+// Arduino Audio Visualizer - 4 PWM LEDs
+// Receives "v1,v2,v3,v4\n" (values 0-255) over serial at 115200 baud
+
+const uint8_t LED_PINS[4] = {3, 5, 6, 9};
+
+// Smoothing: 0.0 = no smoothing, 0.99 = heavy smoothing
+const float SMOOTHING = 0.6f;
+
+float smoothed[4] = {0, 0, 0, 0};
+uint8_t current[4] = {0, 0, 0, 0};
+
+String buffer = "";
+
+void setup() {
+  Serial.begin(115200);
+  for (uint8_t i = 0; i < 4; i++) {
+    pinMode(LED_PINS[i], OUTPUT);
+    analogWrite(LED_PINS[i], 0);
+  }
+}
+
+void loop() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      parseAndApply(buffer);
+      buffer = "";
+    } else if (c != '\r') {
+      buffer += c;
+      if (buffer.length() > 64) buffer = ""; // overflow guard
+    }
+  }
+}
+
+void parseAndApply(String line) {
+  int idx = 0;
+  int start = 0;
+  for (int i = 0; i <= line.length() && idx < 4; i++) {
+    if (i == line.length() || line.charAt(i) == ',') {
+      int val = line.substring(start, i).toInt();
+      if (val < 0) val = 0;
+      if (val > 255) val = 255;
+
+      // Exponential smoothing for less flicker
+      smoothed[idx] = SMOOTHING * smoothed[idx] + (1.0f - SMOOTHING) * val;
+      current[idx] = (uint8_t)smoothed[idx];
+      analogWrite(LED_PINS[idx], current[idx]);
+
+      idx++;
+      start = i + 1;
+    }
+  }
+}
