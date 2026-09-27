@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Arduino Audio Visualizer</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 1rem; }
+    button { padding: 0.75rem 1.25rem; font-size: 1rem; margin-right: 0.5rem; cursor: pointer; }
+    .bars { display: flex; gap: 8px; margin-top: 1rem; height: 120px; align-items: flex-end; }
+    .bar { flex: 1; background: #4af; height: 0%; transition: height 0.05s linear; border-radius: 4px 4px 0 0; }
+    .status { margin-top: 1rem; color: #555; font-size: 0.9rem; }
+    label { display: block; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Arduino Audio Visualizer</h1>
+
+  <button id="connect">1. Connect Arduino</button>
+  <button id="start" disabled>2. Start Audio</button>
+  <button id="stop" disabled>Stop</button>
+
+  <label>
+    Sensitivity: <input id="gain" type="range" min="0.5" max="8" step="0.1" value="2.5">
+    <span id="gainVal">2.5</span>
+  </label>
+
+  <div class="bars">
+    <div class="bar" id="b0"></div>
+    <div class="bar" id="b1"></div>
+    <div class="bar" id="b2"></div>
+    <div class="bar" id="b3"></div>
+  </div>
+
+  <div class="status" id="status">Idle</div>
+
+<script>
+const LEDS = 4;
+let port = null, writer = null;
+let audioCtx = null, analyser = null, source = null, stream = null;
+let rafId = null;
+let freqData = null;
+
+const statusEl = document.getElementById('status');
+const connectBtn = document.getElementById('connect');
+const startBtn = document.getElementById('start');
+const stopBtn = document.getElementById('stop');
+const gainEl = document.getElementById('gain');
+const gainVal = document.getElementById('gainVal');
+gainEl.oninput = () => gainVal.textContent = gainEl.value;
+
+// --- Serial ---
+connectBtn.onclick = async () => {
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    writer = port.writable.getWriter();
+    statusEl.textContent = 'Arduino connected.';
+    startBtn.disabled = false;
+    connectBtn.disabled = true;
+  } catch (e) {
+    statusEl.textContent = 'Connect failed: ' + e.message;
+  }
+};
+
+async function sendLevels(levels) {
+  if (!writer) return;
+  const line = levels.join(',') + '\n';
+  try {
+    await writer.write(new TextEncoder().encode(line));
+  } catch (e) {
+    statusEl.textContent = 'Write error: ' + e.message;
+  }
+}
+
+// --- Audio ---
+startBtn.onclick = async () => {
+  try {
+    // Capture system/tab audio. User picks a tab/screen and must check "Share audio".
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,       // required by most browsers even for audio-only share
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+
+    if (stream.getAudioTracks().length === 0) {
+      statusEl.textContent = 'No audio track shared. Re-try and enable "Share audio".';
+      stream.getTracks().forEach(t => t.stop());
+      return;
+    }
+
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    source = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.7;
+    source.connect(analyser);
+    freqData = new Uint8Array(analyser.frequencyBinCount);
+
+    statusEl.textContent = 'Running.';
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    tick();
+  } catch (e) {
+    statusEl.textContent = 'Audio error: ' + e.message;
+  }
+};
+
+stopBtn.onclick = () => {
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = null;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (audioCtx) audioCtx.close();
+  stream = null; audioCtx = null; analyser = null; source = null;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  statusEl.textContent = 'Stopped.';
+  // Turn LEDs off
+  sendLevels([0,0,0,0]);
+};
+
+// Frequency band boundaries in Hz (log-ish spacing sounds better)
+const BANDS_HZ = [
+  [20,   200],   // bass
+  [200,  800],   // low-mid
+  [800,  3000],  // mid
+  [3000, 12000]  // treble
+];
+
+function hzToBin(hz, sampleRate, fftSize) {
+  return Math.round(hz * fftSize / sampleRate);
+}
+
+function tick() {
+  rafId = requestAnimationFrame(tick);
+  if (!analyser) return;
+
+  analyser.getByteFrequencyData(freqData);
+
+  const sampleRate = audioCtx.sampleRate;
+  const fftSize = analyser.fftSize;
+  const gain = parseFloat(gainEl.value);
+
+  const levels = [];
+  for (let b = 0; b < LEDS; b++) {
+    const [lo, hi] = BANDS_HZ[b];
+    const startBin = hzToBin(lo, sampleRate, fftSize);
+    const endBin   = hzToBin(hi, sampleRate, fftSize);
+
+    let sum = 0, count = 0;
+    for (let i = startBin; i <= endBin && i < freqData.length; i++) {
+      sum += freqData[i];
+      count++;
+    }
+    const avg = count ? sum / count : 0;             // 0..255
+    const scaled = Math.min(255, avg * gain);        // apply sensitivity
+    const v = Math.round(scaled);
+    levels.push(v);
+
+    document.getElementById('b' + b).style.height = (v / 255 * 100) + '%';
+  }
+
+  sendLevels(levels);
+}
+
+// Handle user stopping the share via the browser bar
+document.addEventListener('visibilitychange', () => {});
+</script>
+</body>
+</html>
