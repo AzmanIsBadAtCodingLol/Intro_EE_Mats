@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Mic → soundData[] Generator</title>
+<style>
+  body { font-family: sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
+  button { padding: 10px 20px; font-size: 15px; margin: 4px 4px 4px 0; cursor: pointer; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  textarea { width: 100%; height: 240px; font-family: monospace; font-size: 12px; box-sizing: border-box; }
+  #status { margin: 12px 0; padding: 8px 12px; border-radius: 4px; font-family: monospace; white-space: pre-wrap; }
+  .info { background: #e8f0ff; }
+  .ok   { background: #e6ffe6; }
+  .err  { background: #ffe8e8; }
+  #timer { font-weight: bold; font-size: 18px; }
+</style>
+</head>
+<body>
+<h2>Mic → <code>soundData[]</code> Generator</h2>
+<p>Records up to <b>1.5 seconds</b>, converts to 8 kHz mono 8-bit unsigned PCM, and lets you
+   preview the exact audio the ESP32 will produce.</p>
+
+<div>
+  <button id="recBtn" onclick="toggleRecord()">● Record</button>
+  <button id="playBtn" onclick="playBack()" disabled>▶ Play</button>
+  <button id="genBtn" onclick="generate()" disabled>Generate Array</button>
+  <span id="timer" style="margin-left:12px">0.00 s</span>
+</div>
+
+<div id="status" class="info">Ready.</div>
+
+<textarea id="out" placeholder="Generated array will appear here..."></textarea>
+
+<script>
+const MAX_SECONDS = 1.5;
+const TARGET_RATE = 8000;
+
+let mediaStream = null;
+let recorder = null;
+let chunks = [];
+let recording = false;
+let startTime = 0;
+let timerHandle = null;
+let lastPcm = null;        // Uint8Array of last conversion
+let audioCtx = null;
+
+const recBtn  = document.getElementById('recBtn');
+const playBtn = document.getElementById('playBtn');
+const genBtn  = document.getElementById('genBtn');
+const timerEl = document.getElementById('timer');
+const statusEl = document.getElementById('status');
+const outEl = document.getElementById('out');
+
+function setStatus(msg, cls = 'info') {
+  statusEl.textContent = msg;
+  statusEl.className = cls;
+}
+
+async function toggleRecord() {
+  if (recording) {
+    stopRecording();
+    return;
+  }
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    setStatus('Microphone access denied: ' + e.message, 'err');
+    return;
+  }
+
+  chunks = [];
+  recorder = new MediaRecorder(mediaStream);
+  recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+  recorder.onstop = onRecorderStop;
+
+  recorder.start();
+  recording = true;
+  startTime = performance.now();
+  recBtn.textContent = '■ Stop';
+  recBtn.style.background = '#ffd0d0';
+  playBtn.disabled = true;
+  genBtn.disabled = true;
+  setStatus('Recording... speak now.', 'info');
+
+  timerHandle = setInterval(() => {
+    const t = (performance.now() - startTime) / 1000;
+    timerEl.textContent = t.toFixed(2) + ' s';
+    if (t >= MAX_SECONDS) stopRecording();
+  }, 50);
+}
+
+function stopRecording() {
+  if (!recording) return;
+  recording = false;
+  clearInterval(timerHandle);
+  timerEl.textContent = ((performance.now() - startTime) / 1000).toFixed(2) + ' s';
+  recBtn.textContent = '● Record';
+  recBtn.style.background = '';
+  if (recorder && recorder.state !== 'inactive') recorder.stop();
+}
+
+async function onRecorderStop() {
+  mediaStream.getTracks().forEach(t => t.stop());
+  mediaStream = null;
+
+  setStatus('Decoding recording...', 'info');
+  try {
+    const blob = new Blob(chunks, { type: chunks[0]?.type || 'audio/webm' });
+    const ab = await blob.arrayBuffer();
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const decoded = await audioCtx.decodeAudioData(ab);
+
+    setStatus('Resampling to 8 kHz mono...', 'info');
+    const samples = Math.min(Math.ceil(decoded.duration * TARGET_RATE),
+                             Math.floor(MAX_SECONDS * TARGET_RATE));
+    const off = new OfflineAudioContext(1, samples, TARGET_RATE);
+    const src = off.createBufferSource();
+    src.buffer = decoded;
+    src.connect(off.destination);
+    src.start();
+    const mono = await off.startRendering();
+
+    const f32 = mono.getChannelData(0);
+    lastPcm = new Uint8Array(f32.length);
+    let peak = 0;
+    for (let i = 0; i < f32.length; i++) {
+      let v = f32[i];
+      if (v > 1) v = 1; else if (v < -1) v = -1;
+      const abs = Math.abs(v);
+      if (abs > peak) peak = abs;
+      lastPcm[i] = (v + 1) * 127.5;
+    }
+
+    // Normalize so quiet recordings use the full 8-bit range.
+    // Find the current max deviation from 128 and scale up.
+    let maxDev = 0;
+    for (let i = 0; i < lastPcm.length; i++) {
+      const d = Math.abs(lastPcm[i] - 128);
+      if (d > maxDev) maxDev = d;
+    }
+    if (maxDev > 0 && maxDev < 100) {
+      const gain = 127 / maxDev;
+      for (let i = 0; i < lastPcm.length; i++) {
+        let v = Math.round((lastPcm[i] - 128) * gain + 128);
+        if (v < 0) v = 0; else if (v > 255) v = 255;
+        lastPcm[i] = v;
+      }
+    }
+
+    const secs = f32.length / TARGET_RATE;
+    setStatus(
+      `Recorded ${secs.toFixed(2)} s, ${f32.length} samples.\n` +
+      `Raw peak amplitude: ${(peak*100).toFixed(0)}%.\n` +
+      `Playback or generate the array.`,
+      'ok'
+    );
+    playBtn.disabled = false;
+    genBtn.disabled = false;
+  } catch (e) {
+    setStatus('Decode error: ' + e.message, 'err');
+    console.error(e);
+  }
+}
+
+function playBack() {
+  if (!lastPcm) return;
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const buf = audioCtx.createBuffer(1, lastPcm.length, TARGET_RATE);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < lastPcm.length; i++) ch[i] = (lastPcm[i] - 128) / 128;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  src.start();
+  setStatus('Playing 8 kHz preview (same as ESP32 will produce)...', 'info');
+  src.onended = () => setStatus('Preview finished.', 'ok');
+}
+
+function generate() {
+  if (!lastPcm) return;
+  const lines = [];
+  lines.push(`const uint8_t PROGMEM soundData[] = {`);
+  for (let i = 0; i < lastPcm.length; i += 16) {
+    const row = [];
+    for (let j = 0; j < 16 && i + j < lastPcm.length; j++) {
+      row.push('0x' + lastPcm[i + j].toString(16).padStart(2, '0').toUpperCase());
+    }
+    lines.push('  ' + row.join(', ') + ',');
+  }
+  lines.push(`};`);
+  lines.push(`const size_t soundLen = ${lastPcm.length};`);
+  outEl.value = lines.join('\n');
+  outEl.select();
+  setStatus(`Array generated (${lastPcm.length} samples, ${(lastPcm.length/TARGET_RATE).toFixed(2)} s). Text selected — Ctrl+C to copy.`, 'ok');
+}
+</script>
+</body>
+</html>
